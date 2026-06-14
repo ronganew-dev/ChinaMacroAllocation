@@ -1,0 +1,43 @@
+# =========== Data files (large, not committed) ===========
+data/
+*.xlsx
+*.xls
+*.csv
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.pkl
+*.pickle
+
+# =========== Python cache ===========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# =========== IDE / editor ===========
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# =========== Virtual environment ===========
+venv/
+.venv/
+env/
+.env/
+
+# =========== Temporary output ===========
+*.log
+tmp/
+temp/
+
+# =========== Testing ===========
+.pytest_cache/
+testing/
