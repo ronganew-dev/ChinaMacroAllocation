@@ -45,6 +45,18 @@ from operators.cross_sectional import (
 # ── base utility ──
 from operators.base import nanmask
 
+# ── risk_control ──
+from operators.risk_control import (
+    tsmom_signal,
+    tsmom_strength,
+    tsmom_ma_signal,
+    tsmom_signal_binary,
+    valuation_percentile,
+    valuation_zscore,
+    risk_multiplier,
+    risk_status,
+)
+
 __all__ = [
     # momentum
     "acf", "acf_multi", "snr", "hurst_exponent",
@@ -59,4 +71,8 @@ __all__ = [
     "composite_score", "sector_neutralize",
     # utility
     "nanmask",
+    # risk_control
+    "tsmom_signal", "tsmom_strength", "tsmom_ma_signal", "tsmom_signal_binary",
+    "valuation_percentile", "valuation_zscore",
+    "risk_multiplier", "risk_status",
 ]
