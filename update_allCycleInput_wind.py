@@ -158,8 +158,8 @@ def update_all_data():
         new_rows = []
         for dt in new_months:
             row = {"Date": dt}
-            row["SF_ratio"] = last.get("SF_ratio", np.nan)
-            row["SF_total"] = last.get("SF_total", np.nan)
+            for ffill_col in ["SF_ratio", "SF_total", "M1_YoY", "M2_YoY"]:
+                row[ffill_col] = last.get(ffill_col, np.nan)
             for col in ["CPI", "PMI", "CN10Y", "US10Y"]:
                 row[col] = np.nan
             new_rows.append(row)
@@ -184,11 +184,16 @@ def update_all_data():
     if df_sf is not None:
         df_macro.update(df_sf)
 
-    print("    [更新] CPI / PMI / 社融 最新月度数据已填入.")
+    # 从 Wind 拉取 M1 / M2 同比月度数据
+    df_m1m2 = loader._fetch_m1m2(macro_mappings, "2011-01-01", end_date)
+    if df_m1m2 is not None:
+        df_macro.update(df_m1m2)
+
+    print("    [更新] CPI / PMI / 社融 / M1 / M2 最新月度数据已填入.")
 
     # 填充空值并存回 sheets
     df_macro = df_macro.reset_index()
-    for col in ["CPI", "PMI", "CN10Y", "US10Y", "SF_ratio", "SF_total"]:
+    for col in ["CPI", "PMI", "CN10Y", "US10Y", "SF_ratio", "SF_total", "M1_YoY", "M2_YoY"]:
         if col in df_macro.columns:
             df_macro[col] = df_macro[col].ffill().bfill()
     if "YM" in df_macro.columns:

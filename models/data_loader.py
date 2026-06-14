@@ -385,6 +385,35 @@ class WindDataLoader(BaseDataLoader):
         except RuntimeError:
             return None
 
+    def _fetch_m1m2(self, macro_mappings: dict, start: str, end: str):
+        """
+        拉取 M1 / M2 同比增速，月频。
+
+        Wind EDB 代码:
+            M0000551 — M1:同比
+            M0001385 — M2:同比
+        """
+        from WindPy import w
+
+        m1 = macro_mappings.get("M1_YoY", {}).get("ticker")
+        m2 = macro_mappings.get("M2_YoY", {}).get("ticker")
+        if not m1 or not m2:
+            return None
+
+        try:
+            res = self._call_with_retry(w.edb, [m1, m2], start, end)
+            df = pd.DataFrame(
+                res.Data,
+                index=["M1_YoY", "M2_YoY"],
+                columns=pd.to_datetime(res.Times),
+            ).T
+            df.index.name = "Date"
+            df = df.reset_index()
+            df["YM"] = df["Date"].dt.to_period("M")
+            return df.groupby("YM")[["M1_YoY", "M2_YoY"]].last()
+        except RuntimeError:
+            return None
+
     def load_macro_data(
         self,
         start_date: Optional[str] = None,
@@ -407,7 +436,10 @@ class WindDataLoader(BaseDataLoader):
         # 3. 社融（可选）
         df_sf = self._fetch_social_financing(macro_mappings, start, end)
 
-        # 4. 统一月度时间索引
+        # 4. M1 / M2 同比（可选）
+        df_m1m2 = self._fetch_m1m2(macro_mappings, start, end)
+
+        # 5. 统一月度时间索引
         monthly_range = pd.date_range(
             start=pd.to_datetime(start), end=pd.to_datetime(end), freq="ME"
         )
@@ -417,13 +449,15 @@ class WindDataLoader(BaseDataLoader):
         df_macro["YM"] = df_macro["Date"].dt.to_period("M")
         df_macro = df_macro.set_index("YM")
 
-        for col in ["CN10Y", "US10Y", "CPI", "PMI", "SF_ratio", "SF_total"]:
+        for col in ["CN10Y", "US10Y", "CPI", "PMI", "SF_ratio", "SF_total", "M1_YoY", "M2_YoY"]:
             df_macro[col] = np.nan
 
         df_macro.update(monthly_yield_avg)
         df_macro.update(df_macro_wind)
         if df_sf is not None:
             df_macro.update(df_sf)
+        if df_m1m2 is not None:
+            df_macro.update(df_m1m2)
 
         df_macro = df_macro.reset_index(drop=True)
         df_macro = df_macro.ffill().bfill()
