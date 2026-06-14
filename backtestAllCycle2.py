@@ -1,7 +1,4 @@
-"""
-Backtest All Cycle Stratage program
-By Hujun Tang, 2026.04.12
-"""
+
 
 import models
 import sys
