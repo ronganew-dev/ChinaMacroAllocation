@@ -33,7 +33,12 @@ venv/
 env/
 .env/
 
-# =========== Temporary output ===========
+# =========== WorkBuddy workspace cache ===========
+.workbuddy/
+
+# =========== Generated reports ===========
+*.report.md
+trend_following_report.md
 *.log
 tmp/
 temp/

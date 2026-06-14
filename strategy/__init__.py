@@ -7,16 +7,14 @@ strategy — 宏观周期资产配置策略
 
 from strategy.config import Config
 from strategy.utils import (
-    calc_ewma_cov,
-    calc_drawdowns,
+    calc_ewma,
     find_month_end,
     write_dataframes_to_excel,
 )
 
 __all__ = [
     "Config",
-    "calc_ewma_cov",
-    "calc_drawdowns",
+    "calc_ewma",
     "find_month_end",
     "write_dataframes_to_excel",
 ]

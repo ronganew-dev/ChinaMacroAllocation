@@ -1,37 +1,62 @@
 """
-ChinaMacroAllocation — 通用量化算子库 (Quant Operators)
+ChinaMacroAllocation — Formulaic Operators 通用量化算子库
 
-提供可复用的金融数据计算算子，按功能模块分组：
-- momentum: 动量/趋势类 (自相关、信噪比、Hurst指数、连涨连跌等)
-- volatility: 波动率/风险类 (EWMA协方差、回撤计算)
-- cross_sectional: 横截面类 (排名、评分、中性化)
-- volume: 量价结合类 (VWAP、资金流向等) — 🔧 开发中
+工程规范：
+- 纯函数式，无类、无状态、无 fit/transform
+- 全程向量化（pandas / numpy），零显式数据元素循环
+- 原子粒度：每个函数 = 一个公式
+- 输入/输出全部为 pandas Series / DataFrame
+
+参考标准：WorldQuant BRAIN Formulaic Operators
 """
 
-from operators.base import TimeSeriesOperator
+# ── momentum ──
 from operators.momentum import (
-    compute_autocorr,
-    compute_snr,
-    compute_hurst,
-    compute_streaks,
-    compute_trend_efficiency,
-    compute_trend_stability,
-    compute_ma_backtest,
+    acf,
+    acf_multi,
+    snr,
+    hurst_exponent,
+    streaks,
+    trend_efficiency,
+    trend_strength,
+    trend_stability,
+    ma_crossover_metrics,
 )
-from operators.volatility import calc_ewma_cov, calc_drawdowns
-from operators.cross_sectional import cross_sectional_rank, composite_score
+
+# ── volatility ──
+from operators.volatility import (
+    ewma_cov,
+    ewma_weights,
+    drawdown_series,
+    max_drawdown,
+    drawdown_details,
+    recovery_time,
+    ulcer_index,
+)
+
+# ── cross_sectional ──
+from operators.cross_sectional import (
+    cross_sectional_rank,
+    cross_sectional_zscore,
+    composite_score,
+    sector_neutralize,
+)
+
+# ── base utility ──
+from operators.base import nanmask
 
 __all__ = [
-    "TimeSeriesOperator",
-    "compute_autocorr",
-    "compute_snr",
-    "compute_hurst",
-    "compute_streaks",
-    "compute_trend_efficiency",
-    "compute_trend_stability",
-    "compute_ma_backtest",
-    "calc_ewma_cov",
-    "calc_drawdowns",
-    "cross_sectional_rank",
-    "composite_score",
+    # momentum
+    "acf", "acf_multi", "snr", "hurst_exponent",
+    "streaks", "trend_efficiency", "trend_strength",
+    "trend_stability", "ma_crossover_metrics",
+    # volatility
+    "ewma_cov", "ewma_weights",
+    "drawdown_series", "max_drawdown", "drawdown_details",
+    "recovery_time", "ulcer_index",
+    # cross_sectional
+    "cross_sectional_rank", "cross_sectional_zscore",
+    "composite_score", "sector_neutralize",
+    # utility
+    "nanmask",
 ]

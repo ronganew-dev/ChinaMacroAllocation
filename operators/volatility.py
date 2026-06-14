@@ -1,9 +1,10 @@
 """
-波动率/风险类算子 — 资产风险度量和波动特征计算
+波动率/风险类算子 — Formulaic Operators
 
-包含：
-- calc_ewma_cov: 指数加权移动平均协方差矩阵
-- calc_drawdowns: 最大回撤及相关指标
+每个函数 = 一个原子公式，纯向量化，零显式循环。
+输入 pd.Series / np.ndarray → 输出 np.ndarray / Dict。
+
+参考标准：WorldQuant BRAIN Formulaic Operators 工程规范。
 """
 
 from typing import Any, Dict, Optional
@@ -11,145 +12,180 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from operators.base import TimeSeriesOperator
 
+# ===================================================================
+# EWMA 协方差矩阵 | Exponentially Weighted Covariance
+# ===================================================================
 
-# ---------------------------------------------------------------------------
-# EWMA 协方差矩阵
-# ---------------------------------------------------------------------------
-def calc_ewma_cov(
-    data: np.ndarray,
-    decay_factor: float,
-) -> np.ndarray:
+def ewma_weights(n: int, decay: float) -> np.ndarray:
     """
-    计算指数加权移动平均协方差矩阵。
+    生成 EWMA 衰减权重向量 — 纯向量化，无显式循环。
+
+    Formula:
+        w_i = (1 - λ) · λ^{n-1-i}   for i = 0, ..., n-1
 
     Parameters
     ----------
-    data : np.ndarray, shape (n_obs, n_assets)
-        收益率矩阵，每列为一个资产。
-    decay_factor : float
-        衰减因子 (0 < decay_factor < 1)，越小衰减越快。
+    n : int
+        样本长度。
+    decay : float
+        衰减因子 λ (0 < λ < 1)，越小旧数据衰减越快。
 
     Returns
     -------
-    np.ndarray, shape (n_assets, n_assets)
+    np.ndarray, shape (n,)
     """
-    n = data.shape[0]
-    weights = np.array(
-        [(1 - decay_factor) * decay_factor ** i for i in range(n - 1, -1, -1)]
-    )
-    weights = weights / weights.sum()
-
-    mean = np.dot(weights, data)
-    centered = data - mean
-    weighted_centered = centered * np.sqrt(weights.reshape(-1, 1))
-    return np.dot(weighted_centered.T, weighted_centered)
+    # 向量化生成指数序列: λ^{n-1}, λ^{n-2}, ..., λ^0
+    powers = np.arange(n - 1, -1, -1, dtype=np.float64)
+    weights = (1 - decay) * (decay ** powers)  # 全向量化
+    return weights / weights.sum()
 
 
-# ---------------------------------------------------------------------------
-# 回撤计算
-# ---------------------------------------------------------------------------
-def calc_drawdowns(
-    cumu_value: np.ndarray,
-    dates: pd.DatetimeIndex,
-    is_compounding: bool = True,
-) -> Dict[str, Any]:
-    """
-    计算最大回撤、峰值日期、低谷日期、恢复日期。
+def ewma_cov(data: np.ndarray, decay: float = 0.94) -> np.ndarray:
+    r"""
+    指数加权移动平均协方差矩阵 — 全程向量化。
+
+    Formula:
+        Σ_EWMA = Σ_i w_i · (x_i - μ_w)^T · (x_i - μ_w)
+
+    其中 w_i 为指数衰减权重，μ_w 为加权均值。
 
     Parameters
     ----------
-    cumu_value : np.ndarray
+    data : np.ndarray, shape (T, N)
+        T 个时间点、N 个资产的收益率矩阵。
+    decay : float
+        衰减因子 λ，默认 0.94（日频 EWMA 标准值）。
+
+    Returns
+    -------
+    np.ndarray, shape (N, N)
+        协方差矩阵。
+    """
+    T = data.shape[0]
+    w = ewma_weights(T, decay)  # (T,), 纯向量化
+
+    # 加权均值
+    mean = np.dot(w, data)  # (N,)
+
+    # 中心化 + 加权
+    centered = data - mean  # (T, N)
+    weighted = centered * np.sqrt(w[:, np.newaxis])  # (T, N)
+
+    return weighted.T @ weighted  # (N, N)
+
+
+# ===================================================================
+# 最大回撤 | Maximum Drawdown
+# ===================================================================
+
+def drawdown_series(nav: pd.Series) -> pd.Series:
+    r"""
+    回撤序列 — 纯向量化。
+
+    Formula:
+        DD(t) = NAV(t) / max_{s ≤ t} NAV(s) - 1
+
+    Parameters
+    ----------
+    nav : pd.Series
         累计净值序列。
-    dates : pd.DatetimeIndex
-        对应日期索引。
-    is_compounding : bool
-        True → 复利净值（相对回撤）；False → 累加序列（绝对回撤）。
 
     Returns
     -------
-    Dict with keys: peak, peak_date, trough_date, recovery_date
+    pd.Series，对齐 nav 的索引。
     """
-    nav = pd.Series(cumu_value, index=dates)
-    if is_compounding:
-        nav = nav / nav.iloc[0]
+    running_max = nav.expanding().max()
+    safe = running_max.replace(0, np.nan)
+    dd = nav / safe - 1
+    return dd.replace([np.inf, -np.inf], np.nan)
 
-    max_nav = nav.expanding().max()
 
-    if is_compounding:
-        safe_max = max_nav.replace(0, np.nan)
-        drawdown = nav / safe_max - 1
-    else:
-        drawdown = nav - max_nav
+def max_drawdown(nav: pd.Series) -> float:
+    r"""
+    最大回撤。
 
-    drawdown = drawdown.replace([np.inf, -np.inf], np.nan)
-    max_dd = drawdown.min(skipna=True)
-    peak_date = max_nav.idxmax()
+    Formula:
+        MaxDD = min_t [ NAV(t) / max_{s ≤ t} NAV(s) - 1 ]
+    """
+    dd = drawdown_series(nav)
+    return float(dd.min(skipna=True))
 
-    valid_dd = drawdown.dropna()
-    if valid_dd.empty:
+
+def drawdown_details(nav: pd.Series) -> Dict[str, Any]:
+    """
+    最大回撤详情 — 峰值、谷值、恢复时间。
+
+    全程向量化，零显式循环。
+
+    Returns
+    -------
+    Dict with keys:
+        peak_value, peak_date, trough_value, trough_date,
+        recovery_date, max_drawdown
+    """
+    running_max = nav.expanding().max()
+    dd = nav / running_max.replace(0, np.nan) - 1
+    dd = dd.replace([np.inf, -np.inf], np.nan)
+
+    if dd.dropna().empty:
         return {
-            "peak": [0.0],
-            "peak_date": [dates[0]],
-            "trough_date": [dates[0]],
-            "recovery_date": [dates[0]],
+            "peak_value": float(nav.iloc[0]),
+            "peak_date": nav.index[0],
+            "trough_value": float(nav.iloc[0]),
+            "trough_date": nav.index[0],
+            "recovery_date": nav.index[0],
+            "max_drawdown": 0.0,
         }
 
-    trough_date = valid_dd.idxmin()
-    recovery_date = None
-    try:
-        loc = drawdown.index.get_loc(trough_date)
-        for i in range(loc, len(drawdown)):
-            if drawdown.iloc[i] >= 0:
-                recovery_date = drawdown.index[i]
-                break
-    except (KeyError, ValueError):
-        pass
+    trough_idx = dd.idxmin()
+    trough_val = float(nav.loc[trough_idx])
+    max_dd = float(dd.loc[trough_idx])
+
+    # 峰值 = 回撤起点（running_max 为最高值时的日期）
+    peak_date = running_max.loc[:trough_idx].idxmax()
+    peak_val = float(nav.loc[peak_date])
+
+    # 恢复日期：谷底后首次回到峰值（全向量化）
+    after_trough = nav.index > trough_idx
+    if after_trough.any():
+        recovered = (nav >= peak_val) & after_trough
+        recovery_date = nav.index[recovered].min() if recovered.any() else None
+    else:
+        recovery_date = None
 
     return {
-        "peak": [max_dd],
-        "peak_date": [peak_date],
-        "trough_date": [trough_date],
-        "recovery_date": [recovery_date],
+        "peak_value": peak_val,
+        "peak_date": peak_date,
+        "trough_value": trough_val,
+        "trough_date": trough_idx,
+        "recovery_date": recovery_date,
+        "max_drawdown": max_dd,
     }
 
 
-# ===================================================================
-# 算子类封装
-# ===================================================================
+def recovery_time(nav: pd.Series) -> Optional[int]:
+    """
+    回撤恢复所需交易日数。
 
-class EWMAVolatilityOperator(TimeSeriesOperator):
-    """EWMA 波动率协方差算子"""
-
-    def __init__(self, decay_factor: float = 0.5 ** (1 / 63), name: str = None):
-        super().__init__(name or "EWMAVolatilityOperator")
-        self.decay_factor = decay_factor
-        self._cov_matrix: Optional[np.ndarray] = None
-
-    def fit(self, series: pd.Series) -> "EWMAVolatilityOperator":
-        return self
-
-    def transform(self, series: pd.Series) -> np.ndarray:
-        # 单资产转列向量
-        data = series.values.reshape(-1, 1)
-        self._cov_matrix = calc_ewma_cov(data, self.decay_factor)
-        return self._cov_matrix
+    返回从谷底到首次恢复的交易天数，若未恢复则返回 None。
+    """
+    info = drawdown_details(nav)
+    if info["recovery_date"] is None:
+        return None
+    loc = nav.index.get_loc(info["trough_date"])
+    if loc is None:
+        return None
+    loc_rec = nav.index.get_loc(info["recovery_date"])
+    return int(loc_rec - loc)
 
 
-class DrawdownOperator(TimeSeriesOperator):
-    """回撤分析算子"""
+def ulcer_index(nav: pd.Series) -> float:
+    r"""
+    Ulcer 指数 — 衡量回撤深度与持续时间的综合指标。
 
-    def __init__(self, is_compounding: bool = True, name: str = None):
-        super().__init__(name or "DrawdownOperator")
-        self.is_compounding = is_compounding
-        self._result: Optional[Dict[str, Any]] = None
-
-    def fit(self, series: pd.Series) -> "DrawdownOperator":
-        return self
-
-    def transform(self, series: pd.Series) -> Dict[str, Any]:
-        # 需要 series 是累计净值，用 cumprod 转换
-        cumu = (1 + series).cumprod().values
-        self._result = calc_drawdowns(cumu, series.index, self.is_compounding)
-        return self._result
+    Formula:
+        UI = sqrt( (1/N) · Σ_t DD(t)^2 )
+    """
+    dd = drawdown_series(nav)
+    return float(np.sqrt((dd**2).mean(skipna=True)))

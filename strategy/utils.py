@@ -10,7 +10,10 @@ import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 
-from operators.volatility import calc_ewma_cov, calc_drawdowns
+from operators.volatility import ewma_cov
+
+# 为了向后兼容
+calc_ewma = ewma_cov
 
 
 def find_month_end(dates: pd.DatetimeIndex) -> list:
@@ -39,7 +42,3 @@ def write_dataframes_to_excel(df_dict: dict, file_path: str):
         with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
             for sheet_name, df in df_dict.items():
                 df.to_excel(writer, sheet_name=sheet_name)
-
-
-# 为了向后兼容，导出别名
-calc_ewma = lambda data, decay_factor: calc_ewma_cov(data, decay_factor)  # noqa: E731

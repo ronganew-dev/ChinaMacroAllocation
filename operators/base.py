@@ -1,38 +1,59 @@
 """
-基础算子抽象 — 量化算子的抽象基类约定
+基础工具 — Formulaic Operators 底层支持
 
-所有算子应继承 TimeSeriesOperator，统一接口：
-- fit(series) → 内部状态
-- transform(series) → 结果
-- fit_transform(series) → 链式调用
+不定义任何算子类。
+Formulaic Operators 是纯函数式范式：
+- 无类、无状态、无 fit/transform
+- 每个函数 = 一个原子公式
+- 输入 pandas Series/DataFrame → 输出同等类型
+
+本模块仅提供：
+- nanmask: 输入验证与自动过滤的装饰器
+- 类型别名约定
 """
 
-from abc import ABC, abstractmethod
-from typing import Any
+from functools import wraps
+from typing import Callable, Optional, Tuple, TypeVar
 
+import numpy as np
 import pandas as pd
 
+# ── 类型别名 ──────────────────────────────────────────────
+Series = pd.Series
+Frame = pd.DataFrame
 
-class TimeSeriesOperator(ABC):
-    """时序算子抽象基类"""
+T = TypeVar("T")
 
-    def __init__(self, name: str = None):
-        self.name = name or self.__class__.__name__
-        self._fitted = False
 
-    @abstractmethod
-    def fit(self, series: pd.Series) -> "TimeSeriesOperator":
-        """学习序列所需的状态参数"""
-        ...
+def nanmask(
+    min_periods: int = 1,
+    drop_inf: bool = True,
+) -> Callable:
+    """
+    装饰器：自动丢弃 NaN/Inf 后执行运算，
+    并保持与输入对齐的索引。
 
-    @abstractmethod
-    def transform(self, series: pd.Series) -> Any:
-        """对序列施加算子逻辑，返回计算结果"""
-        ...
+    Parameters
+    ----------
+    min_periods : int
+        要求最少有效观测数，不足则返回 NaN。
+    drop_inf : bool
+        是否在计算前剔除无限值。
 
-    def fit_transform(self, series: pd.Series) -> Any:
-        """拟合并转换"""
-        return self.fit(series).transform(series)
-
-    def __repr__(self) -> str:
-        return f"<{self.name}>"
+    Examples
+    --------
+    >>> @nanmask(min_periods=20)
+    ... def sharpe(s: pd.Series) -> float:
+    ...     return s.mean() / s.std() * 252**0.5
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(s: pd.Series, *args, **kwargs) -> T:
+            s = s.dropna()
+            if drop_inf:
+                s = s.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(s) < min_periods:
+                return type(s)([np.nan], index=s.index[:1]) if isinstance(s, pd.Series) else np.nan
+            return func(s, *args, **kwargs)
+        return wrapper
+    return decorator

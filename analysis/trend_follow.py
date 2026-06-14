@@ -13,13 +13,14 @@ import numpy as np
 import pandas as pd
 
 from operators.momentum import (
-    compute_autocorr,
-    compute_hurst,
-    compute_ma_backtest,
-    compute_snr,
-    compute_streaks,
-    compute_trend_efficiency,
-    compute_trend_stability,
+    acf_multi,
+    hurst_exponent,
+    ma_crossover_metrics,
+    snr,
+    streaks,
+    trend_efficiency,
+    trend_stability,
+    trend_strength,
 )
 from operators.cross_sectional import composite_score, cross_sectional_rank
 
@@ -129,13 +130,11 @@ def analyze_all(
         period_data = split_periods(assets)
 
     stat_metrics = {
-        "SNR": compute_snr,
-        "Hurst": compute_hurst,
-        "Trend_Stability": compute_trend_stability,
-        "Trend_Efficiency": lambda s: compute_trend_efficiency(s)[
-            "trend_efficiency"
-        ],
-        "Trend_Strength": lambda s: compute_trend_efficiency(s)["trend_strength"],
+        "SNR": snr,
+        "Hurst": hurst_exponent,
+        "Trend_Stability": trend_stability,
+        "Trend_Efficiency": trend_efficiency,
+        "Trend_Strength": trend_strength,
     }
 
     rows_stat, rows_ac, rows_streak, rows_ma = [], [], [], []
@@ -158,7 +157,7 @@ def analyze_all(
             rows_stat.append(row)
 
             # 自相关
-            ac = compute_autocorr(series)
+            ac = acf_multi(series)
             row_ac = {
                 "asset": name_cn,
                 "asset_en": ASSET_NAMES_EN.get(name_cn, name_cn),
@@ -168,7 +167,7 @@ def analyze_all(
             rows_ac.append(row_ac)
 
             # 连涨连跌
-            streak = compute_streaks(series)
+            streak = streaks(series)
             row_streak = {
                 "asset": name_cn,
                 "asset_en": ASSET_NAMES_EN.get(name_cn, name_cn),
@@ -178,7 +177,7 @@ def analyze_all(
             rows_streak.append(row_streak)
 
             # 双均线回测
-            ma = compute_ma_backtest(series)
+            ma = ma_crossover_metrics(series)
             row_ma = {
                 "asset": name_cn,
                 "asset_en": ASSET_NAMES_EN.get(name_cn, name_cn),
