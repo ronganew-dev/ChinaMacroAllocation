@@ -57,6 +57,12 @@ from operators.risk_control import (
     risk_status,
 )
 
+# ── calendar_utils ──
+from operators.calendar_utils import (
+    find_month_end,
+    write_dataframes_to_excel,
+)
+
 __all__ = [
     # momentum
     "acf", "acf_multi", "snr", "hurst_exponent",
@@ -75,4 +81,7 @@ __all__ = [
     "tsmom_signal", "tsmom_strength", "tsmom_ma_signal", "tsmom_signal_binary",
     "valuation_percentile", "valuation_zscore",
     "risk_multiplier", "risk_status",
+    # calendar_utils
+    "find_month_end",
+    "write_dataframes_to_excel",
 ]
