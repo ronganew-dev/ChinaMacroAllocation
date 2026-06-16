@@ -1,464 +1,442 @@
+# -*- coding: utf-8 -*-
 """
-数据加载器 — Data Loader Module
+Module: models.data_loader
+Description: 数据加载与缓存模块 — CSV驱动 + Parquet缓存
 
-统一的数据获取抽象层，支持从 Excel 文件和 Wind API 两种数据源
-获取资产日频收益率和月频宏观因子数据。
+架构
+----
+  CSV配置 (config/*.csv)  →  WindFetcher  →  Parquet缓存 (data/cache/*.parquet)
+                                      ↘  DataFrame
 
-设计原则：
-- 接口统一：BaseDataLoader → ExcelDataLoader / WindDataLoader
-- 配置驱动：asset_mappings / macro_mappings 从 data_hub_config.json 读取
-- 增量获取：支持 start_date 只拉取增量数据
-- 容错机制：Wind API 调用含自动重试
+核心理念
+--------
+  1. CSV 配置：手工增删行即可新增/删除数据源，无需改代码
+  2. Parquet 缓存：Wind 取数后自动存盘，下次优先读本地
+  3. 扁平设计：一个函数取一个序列，不搞复杂继承
+
+用法
+----
+  from models.data_loader import WindFetcher
+
+  fetcher = WindFetcher()
+  df_macro = fetcher.fetch_macro()          # 读取/更新宏观数据
+  df_ret   = fetcher.fetch_returns()        # 读取/更新资产收益率
+  df_raw   = fetcher.fetch_series("CPI")   # 取单个序列
 """
 
 import os
 import time
-from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 
-# ===================================================================
-# 抽象基类 | Abstract Base Data Loader
-# ===================================================================
+# ═══════════════════════════════════════════════════════════════
+# 路径常量
+# ═══════════════════════════════════════════════════════════════
 
-class BaseDataLoader(ABC):
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_DIR = _PROJECT_ROOT / "config"
+_CACHE_DIR = _PROJECT_ROOT / "data" / "cache"
+
+ASSET_CSV = _CONFIG_DIR / "asset_tickers.csv"
+MACRO_CSV = _CONFIG_DIR / "macro_tickers.csv"
+
+
+# ═══════════════════════════════════════════════════════════════
+# CSV 配置读取
+# ═══════════════════════════════════════════════════════════════
+
+def read_asset_config(csv_path: Optional[str] = None) -> pd.DataFrame:
     """
-    数据加载器抽象基类。
+    读取资产配置 CSV。
+
+    Returns
+    -------
+    pd.DataFrame
+        列: name, ticker, type, freq, field, desc
+    """
+    path = Path(csv_path) if csv_path else ASSET_CSV
+    df = pd.read_csv(path, comment="#", skipinitialspace=True)
+    required = {"name", "ticker", "type", "freq", "field"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"资产配置 CSV 缺少必需列: {missing}")
+    return df
+
+
+def read_macro_config(csv_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    读取宏观指标配置 CSV。
+
+    Returns
+    -------
+    pd.DataFrame
+        列: name, ticker, freq, group, desc
+    """
+    path = Path(csv_path) if csv_path else MACRO_CSV
+    df = pd.read_csv(path, comment="#", skipinitialspace=True)
+    required = {"name", "ticker", "freq", "group"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"宏观配置 CSV 缺少必需列: {missing}")
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
+# WindFetcher — 核心取数类
+# ═══════════════════════════════════════════════════════════════
+
+class WindFetcher:
+    """
+    从 Wind EDB / wsd 获取数据，自动缓存为 Parquet。
+
+    流程
+    ----
+      1. 读 CSV 配置 → 知道要取哪些序列
+      2. 检查 Parquet 缓存 → 有则增量更新，无则全量拉取
+      3. 调 Wind API → 存 Parquet → 返回 DataFrame
 
     Parameters
     ----------
-    config : dict
-        配置字典，包含 data_source, excel_path, asset_mappings, macro_mappings 等。
-    """
-
-    def __init__(self, config: dict):
-        self.config = config
-
-    @abstractmethod
-    def load_returns(
-        self,
-        assets: List[str],
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """
-        加载资产的日频收益率数据。
-
-        Parameters
-        ----------
-        assets : List[str]
-            需要获取的资产名称列表。
-        start_date : str or None
-            起始日期 "YYYY-MM-DD"，None 表示从最早数据开始。
-        end_date : str or None
-            截止日期，None 表示最新。
-
-        Returns
-        -------
-        pd.DataFrame
-            列: ['Date', asset_1, asset_2, ...]
-        """
-        ...
-
-    @abstractmethod
-    def load_macro_data(
-        self,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """
-        加载月频宏观因子数据。
-
-        Parameters
-        ----------
-        start_date : str or None
-            起始日期。
-        end_date : str or None
-            截止日期。
-
-        Returns
-        -------
-        pd.DataFrame
-            列: ['Date', 'CPI', 'PMI', 'CN10Y', 'US10Y', 'SF_ratio', 'SF_total', ...]
-        """
-        ...
-
-
-# ===================================================================
-# Excel 数据加载器 | Excel Data Loader
-# ===================================================================
-
-class ExcelDataLoader(BaseDataLoader):
-    """
-    从 Excel 文件读取收益率和宏观因子数据。
-
-    数据源约定位于 config["excel_path"]，包含 'return' 和 'macroData' 两个工作表。
-    """
-
-    def _resolve_path(self, config_path: str) -> str:
-        """
-        将配置文件中的相对路径解析为绝对路径。
-
-        相对于项目根目录（包含 models/ 的上一级）。
-        """
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        full_path = os.path.join(base_dir, config_path)
-        if not os.path.exists(full_path):
-            raise FileNotFoundError(f"未找到 Excel 数据源: {full_path}")
-        return full_path
-
-    def _read_sheet(self, sheet_name: str) -> pd.DataFrame:
-        """统一读取指定工作表"""
-        excel_path = self.config.get("excel_path", "data/input/allCycleInput.xlsx")
-        full_path = self._resolve_path(excel_path)
-        return pd.read_excel(full_path, sheet_name=sheet_name)
-
-    def load_returns(
-        self,
-        assets: List[str],
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> pd.DataFrame:
-        df = self._read_sheet("return")
-        df["Date"] = pd.to_datetime(df["Date"])
-
-        cols = ["Date"] + [a for a in assets if a in df.columns]
-        df = df[cols]
-
-        if start_date:
-            df = df[df["Date"] >= pd.to_datetime(start_date)]
-        if end_date:
-            df = df[df["Date"] <= pd.to_datetime(end_date)]
-
-        return df.reset_index(drop=True)
-
-    def load_macro_data(
-        self,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> pd.DataFrame:
-        df = self._read_sheet("macroData")
-        df["Date"] = pd.to_datetime(df["Date"])
-
-        if start_date:
-            df = df[df["Date"] >= pd.to_datetime(start_date)]
-        if end_date:
-            df = df[df["Date"] <= pd.to_datetime(end_date)]
-
-        return df.reset_index(drop=True)
-
-
-# ===================================================================
-# Wind API 数据加载器 | Wind Data Loader
-# ===================================================================
-
-class WindDataLoader(BaseDataLoader):
-    """
-    通过 Wind API (WindPy) 实时获取资产收益率和宏观因子数据。
-
-    Wind 接口调用含自动重试机制（最多 RETRY_MAX 次），
-    应对 Wind 终端偶发性接口超时或连接断开。
-
-    Parameters
-    ----------
-    config : dict
-        必需键: asset_mappings, macro_mappings
-        可选键: wind_retry_max (默认 3), wind_retry_delay (默认 2 秒)
+    cache_dir : str or Path, optional
+        Parquet 缓存目录，默认 data/cache/
+    start_date : str, optional
+        数据起始日期，默认 "2011-01-01"
+    retry_max : int
+        Wind API 调用失败重试次数，默认 3
+    retry_delay : float
+        重试间隔秒数，默认 2.0
     """
 
     RETRY_MAX: int = 3
     RETRY_DELAY: float = 2.0
 
-    def __init__(self, config: dict):
-        super().__init__(config)
+    def __init__(
+        self,
+        cache_dir: Optional[str] = None,
+        start_date: str = "2011-01-01",
+        retry_max: int = 3,
+        retry_delay: float = 2.0,
+    ):
+        self.cache_dir = Path(cache_dir) if cache_dir else _CACHE_DIR
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.start_date = start_date
+        self.retry_max = retry_max
+        self.retry_delay = retry_delay
         self._wind_started = False
 
-    # ── Wind 连接管理 ──
+        self.asset_cfg = read_asset_config()
+        self.macro_cfg = read_macro_config()
 
-    def _start_wind(self) -> None:
-        """初始化并验证 Wind API 连接"""
+    # ── Wind 连接 ──
+
+    def _ensure_wind(self) -> None:
+        """初始化 Wind 连接"""
         if self._wind_started:
             return
-
-        try:
-            from WindPy import w
-        except ImportError:
-            raise ImportError(
-                "未检测到 WindPy 库，请确保已安装 Wind 终端及其 Python API 接口。"
-            )
-
+        from WindPy import w
         w.start()
         if not w.isconnected():
-            raise ConnectionError(
-                "无法连接至 Wind API，请确认 Wind 终端已启动并登录！"
-            )
+            raise ConnectionError("Wind 终端未连接，请确认已启动并登录")
         self._wind_started = True
 
     def _call_with_retry(self, func, *args, **kwargs):
-        """
-        带自动重试的 Wind API 调用封装。
-
-        当 ErrorCode 非零时自动重试，最多 RETRY_MAX 次。
-        """
+        """带自动重试的 Wind API 调用"""
         last_error = None
-        for attempt in range(1, self.RETRY_MAX + 1):
+        for attempt in range(1, self.retry_max + 1):
             result = func(*args, **kwargs)
             if result.ErrorCode == 0:
                 return result
-
             last_error = (result.ErrorCode, result.Data)
-            if attempt < self.RETRY_MAX:
-                time.sleep(self.RETRY_DELAY)
-
+            if attempt < self.retry_max:
+                time.sleep(self.retry_delay)
         raise RuntimeError(
-            f"Wind API 调用失败 (已重试 {self.RETRY_MAX} 次), "
-            f"ErrorCode={last_error[0]}, Data={last_error[1]}"
+            f"Wind API 调用失败 (重试 {self.retry_max} 次), "
+            f"ErrorCode={last_error[0]}"
         )
 
-    # ── 收益率数据 ──
+    # ── 单序列取数 ──
 
-    def _parse_asset_mappings(self, assets: List[str]) -> Tuple[List[str], List[str], dict]:
+    def fetch_series(
+        self,
+        name: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
         """
-        根据配置的 asset_mappings，将资产名拆分为 ETF 列表和指数列表。
+        获取单个数据序列。
+
+        优先读 Parquet 缓存，缓存不存在或 use_cache=False 时调 Wind。
+
+        Parameters
+        ----------
+        name : str
+            序列名称（必须在 CSV 配置中存在）
+        start_date : str, optional
+            起始日期
+        end_date : str, optional
+            截止日期
+        use_cache : bool
+            是否优先使用 Parquet 缓存
 
         Returns
         -------
-        etf_tickers : List[str]
-            需用 wsd 提取复权净值的 ETF。
-        idx_tickers : List[str]
-            需用 wsd 提取收盘价的指数。
-        asset_to_ticker : dict
-            {asset_name: (ticker, type)}
+        pd.DataFrame
+            列: [Date, <name>]
         """
-        mappings = self.config.get("asset_mappings", {})
-        etf_tickers: List[str] = []
-        idx_tickers: List[str] = []
-        asset_to_ticker: dict = {}
+        start = start_date or self.start_date
+        end = end_date or pd.Timestamp.now().strftime("%Y-%m-%d")
+        cache_path = self.cache_dir / f"{name}.parquet"
 
-        for asset in assets:
-            if asset not in mappings:
-                raise ValueError(
-                    f"资产 '{asset}' 的 Wind 映射未定义，"
-                    f"请在配置文件的 asset_mappings 中添加。"
-                )
-            ticker = mappings[asset]["ticker"]
-            atype = mappings[asset]["type"]
-            asset_to_ticker[asset] = (ticker, atype)
-            if atype == "ETF":
-                etf_tickers.append(ticker)
-            else:
-                idx_tickers.append(ticker)
+        # 1. 尝试读缓存
+        if use_cache and cache_path.exists():
+            df_cached = pd.read_parquet(cache_path)
+            df_cached["Date"] = pd.to_datetime(df_cached["Date"])
+            cached_end = df_cached["Date"].max().strftime("%Y-%m-%d")
+            if cached_end >= end:
+                df = df_cached[df_cached["Date"] >= pd.to_datetime(start)].copy()
+                return df.reset_index(drop=True)
+            # 增量更新
+            start = pd.Timestamp(cached_end).strftime("%Y-%m-%d")
+            df_new = self._fetch_from_wind(name, start, end)
+            if df_new is not None and len(df_new) > 0:
+                df_new = df_new[df_new["Date"] > df_cached["Date"].max()]
+                df_all = pd.concat([df_cached, df_new], ignore_index=True)
+                df_all.to_parquet(cache_path, index=False)
+                return df_all[df_all["Date"] >= pd.to_datetime(start_date or self.start_date)].reset_index(drop=True)
+            return df_cached[df_cached["Date"] >= pd.to_datetime(start_date or self.start_date)].reset_index(drop=True)
 
-        return etf_tickers, idx_tickers, asset_to_ticker
+        # 2. 无缓存，全量拉取
+        df = self._fetch_from_wind(name, start, end)
+        if df is not None and len(df) > 0:
+            df.to_parquet(cache_path, index=False)
+        return df if df is not None else pd.DataFrame(columns=["Date", name])
 
-    def _rename_ticker_columns(
-        self, df: pd.DataFrame, asset_to_ticker: dict, assets: List[str]
-    ) -> pd.DataFrame:
-        """将 Wind 返回的 ticker 列名重命名为资产中文名"""
-        final_cols = ["Date"]
-        for asset in assets:
-            ticker, _ = asset_to_ticker[asset]
-            matched = None
-            for col in df.columns:
-                if str(col).upper() == str(ticker).upper():
-                    matched = col
-                    break
-            if matched is not None:
-                df = df.rename(columns={matched: asset})
-            else:
-                df[asset] = 0.0
-            final_cols.append(asset)
-        return df[final_cols]
+    def _fetch_from_wind(
+        self, name: str, start: str, end: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        从 Wind API 拉取单个序列的原始数据。
 
-    def load_returns(
+        自动识别资产/宏观配置，选择 wsd 或 edb 接口。
+        """
+        self._ensure_wind()
+        from WindPy import w
+
+        # 先查资产配置
+        asset_row = self.asset_cfg[self.asset_cfg["name"] == name]
+        if len(asset_row) > 0:
+            row = asset_row.iloc[0]
+            ticker = row["ticker"]
+            field = row["field"]
+            res = self._call_with_retry(w.wsd, ticker, field, start, end, "")
+            if res.ErrorCode == 0 and res.Data and len(res.Data[0]) > 0:
+                df = pd.DataFrame({
+                    "Date": pd.to_datetime(res.Times),
+                    name: res.Data[0],
+                })
+                return df
+
+        # 再查宏观配置
+        macro_row = self.macro_cfg[self.macro_cfg["name"] == name]
+        if len(macro_row) > 0:
+            row = macro_row.iloc[0]
+            ticker = row["ticker"]
+            res = self._call_with_retry(w.edb, ticker, start, end)
+            if res.ErrorCode == 0 and res.Data and len(res.Data[0]) > 0:
+                df = pd.DataFrame({
+                    "Date": pd.to_datetime(res.Times),
+                    name: res.Data[0],
+                })
+                return df
+
+        print(f"  ⚠️ '{name}' 未在 CSV 配置中找到，跳过")
+        return None
+
+    # ── 批量取数 ──
+
+    def fetch_macro(
         self,
-        assets: List[str],
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        use_cache: bool = True,
     ) -> pd.DataFrame:
-        self._start_wind()
-        from WindPy import w
+        """
+        批量获取所有宏观指标，合并为月频 DataFrame。
 
-        start = start_date or "2011-01-01"
+        日频指标 → 月均值聚合
+        月频指标 → 取每月最后一个值
+
+        Returns
+        -------
+        pd.DataFrame
+            列: [Date, <macro_name_1>, <macro_name_2>, ...]
+        """
+        start = start_date or self.start_date
         end = end_date or pd.Timestamp.now().strftime("%Y-%m-%d")
+        series_list = []
 
-        etf_tickers, idx_tickers, asset_to_ticker = self._parse_asset_mappings(assets)
+        for _, row in self.macro_cfg.iterrows():
+            name = row["name"]
+            freq = row["freq"]
+            print(f"  📡 {name} ({row['ticker']}, {freq}频) ...", end=" ")
 
-        # 获取 ETF 复权净值
-        df_etf = pd.DataFrame()
-        if etf_tickers:
-            res_etf = self._call_with_retry(
-                w.wsd, ",".join(etf_tickers), "nav_adj", start, end, ""
-            )
-            df_etf = pd.DataFrame(
-                res_etf.Data,
-                index=res_etf.Codes,
-                columns=pd.to_datetime(res_etf.Times),
-            ).T
+            try:
+                df_s = self.fetch_series(name, start, end, use_cache=use_cache)
+            except Exception as e:
+                print(f"⚠️ 失败 ({e})")
+                continue
+            if df_s is None or len(df_s) == 0 or name not in df_s.columns:
+                print("⚠️ 无数据")
+                continue
 
-        # 获取指数收盘价
-        df_idx = pd.DataFrame()
-        if idx_tickers:
-            res_idx = self._call_with_retry(
-                w.wsd, ",".join(idx_tickers), "close", start, end, ""
-            )
-            df_idx = pd.DataFrame(
-                res_idx.Data,
-                index=res_idx.Codes,
-                columns=pd.to_datetime(res_idx.Times),
-            ).T
+            # 按频率聚合
+            df_s["Date"] = pd.to_datetime(df_s["Date"])
+            df_s = df_s.dropna(subset=[name])
+            if len(df_s) == 0:
+                print("⚠️ 全 NaN")
+                continue
 
-        # 合并并计算收益率
-        df_combined = pd.concat([df_etf, df_idx], axis=1)
-        df_combined = df_combined.sort_index().ffill()
-        df_rets = df_combined.pct_change().dropna(how="all")
+            df_s["YM"] = df_s["Date"].dt.to_period("M")
+            if freq == "D":
+                monthly = df_s.groupby("YM")[name].mean()
+            else:
+                monthly = df_s.groupby("YM")[name].last()
 
-        # 现金资产特殊处理: 日收益 = 前日收盘价 / 100 / 365
-        if "M0220163" in df_combined.columns:
-            df_rets["M0220163"] = df_combined["M0220163"].shift(1) / 100 / 365
-            df_rets["M0220163"] = df_rets["M0220163"].fillna(0)
+            monthly = monthly.reset_index()
+            monthly["Date"] = monthly["YM"].dt.to_timestamp(how="end").dt.normalize()
+            monthly = monthly[["Date", name]]
+            series_list.append(monthly)
+            print(f"✅ {len(monthly)} 月")
 
-        df_rets = df_rets.reset_index().rename(columns={"index": "Date"})
-        return self._rename_ticker_columns(df_rets, asset_to_ticker, assets).reset_index(drop=True)
+        if not series_list:
+            return pd.DataFrame()
 
-    # ── 宏观因子数据 ──
-
-    def _fetch_yields(self, macro_mappings: dict, start: str, end: str):
-        """拉取 CN10Y 和 US10Y 日度收益率"""
-        from WindPy import w
-
-        cn10y = macro_mappings.get("CN10Y", {}).get("ticker", "M0325687")
-        us10y = macro_mappings.get("US10Y", {}).get("ticker", "G0000891")
-
-        res = self._call_with_retry(w.edb, [cn10y, us10y], start, end)
-        df = pd.DataFrame(
-            res.Data,
-            index=["CN10Y", "US10Y"],
-            columns=pd.to_datetime(res.Times),
-        ).T
-        df.index.name = "Date"
-        df = df.reset_index()
-        df[["CN10Y", "US10Y"]] = df[["CN10Y", "US10Y"]].ffill().bfill()
+        # 以日期为 key 外连接
+        df = series_list[0]
+        for s in series_list[1:]:
+            df = pd.merge(df, s, on="Date", how="outer")
+        df = df.sort_values("Date").reset_index(drop=True)
         return df
 
-    def _fetch_monthly_macro(self, macro_mappings: dict, start: str, end: str):
-        """拉取 CPI 和 PMI 月频数据"""
-        from WindPy import w
-
-        cpi = macro_mappings.get("CPI", {}).get("ticker", "M0000612")
-        pmi = macro_mappings.get("PMI", {}).get("ticker", "M0017126")
-
-        res = self._call_with_retry(w.edb, [cpi, pmi], start, end)
-        df = pd.DataFrame(
-            res.Data,
-            index=["CPI", "PMI"],
-            columns=pd.to_datetime(res.Times),
-        ).T
-        df.index.name = "Date"
-        df = df.reset_index()
-        df["YM"] = df["Date"].dt.to_period("M")
-        return df.groupby("YM")[["CPI", "PMI"]].last()
-
-    def _fetch_social_financing(self, macro_mappings: dict, start: str, end: str):
-        """拉取社融数据（SF_ratio, SF_total），可选"""
-        from WindPy import w
-
-        sf_ratio = macro_mappings.get("SF_ratio", {}).get("ticker")
-        sf_total = macro_mappings.get("SF_total", {}).get("ticker")
-        if not sf_ratio or not sf_total:
-            return None
-
-        try:
-            res = self._call_with_retry(w.edb, [sf_ratio, sf_total], start, end)
-            df = pd.DataFrame(
-                res.Data,
-                index=["SF_ratio", "SF_total"],
-                columns=pd.to_datetime(res.Times),
-            ).T
-            df.index.name = "Date"
-            df = df.reset_index()
-            df["YM"] = df["Date"].dt.to_period("M")
-            return df.groupby("YM")[["SF_ratio", "SF_total"]].last()
-        except RuntimeError:
-            return None
-
-    def _fetch_m1m2(self, macro_mappings: dict, start: str, end: str):
-        """
-        拉取 M1 / M2 同比增速，月频。
-
-        Wind EDB 代码:
-            M0000551 — M1:同比
-            M0001385 — M2:同比
-        """
-        from WindPy import w
-
-        m1 = macro_mappings.get("M1_YoY", {}).get("ticker")
-        m2 = macro_mappings.get("M2_YoY", {}).get("ticker")
-        if not m1 or not m2:
-            return None
-
-        try:
-            res = self._call_with_retry(w.edb, [m1, m2], start, end)
-            df = pd.DataFrame(
-                res.Data,
-                index=["M1_YoY", "M2_YoY"],
-                columns=pd.to_datetime(res.Times),
-            ).T
-            df.index.name = "Date"
-            df = df.reset_index()
-            df["YM"] = df["Date"].dt.to_period("M")
-            return df.groupby("YM")[["M1_YoY", "M2_YoY"]].last()
-        except RuntimeError:
-            return None
-
-    def load_macro_data(
+    def fetch_returns(
         self,
+        asset_names: Optional[list] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        use_cache: bool = True,
     ) -> pd.DataFrame:
-        self._start_wind()
+        """
+        批量获取资产日频收益率。
 
-        start = start_date or "2011-01-01"
+        ETF → 取复权净值 → 算日收益率
+        Index → 取收盘价 → 算日收益率
+        特殊处理: 现金资产 (M0220163) → 日收益 = 前日收盘价 / 100 / 365
+
+        Parameters
+        ----------
+        asset_names : list of str, optional
+            资产名称列表，None 表示取全部
+
+        Returns
+        -------
+        pd.DataFrame
+            列: [Date, <asset_name_1>, <asset_name_2>, ...]
+        """
+        start = start_date or self.start_date
         end = end_date or pd.Timestamp.now().strftime("%Y-%m-%d")
-        macro_mappings = self.config.get("macro_mappings", {})
+        cfg = self.asset_cfg
+        if asset_names:
+            cfg = cfg[cfg["name"].isin(asset_names)]
 
-        # 1. 日度收益率（聚合成月均值）
-        df_yields = self._fetch_yields(macro_mappings, start, end)
-        df_yields["YM"] = pd.to_datetime(df_yields["Date"]).dt.to_period("M")
-        monthly_yield_avg = df_yields.groupby("YM")[["CN10Y", "US10Y"]].mean()
+        price_series = []
+        cash_assets = cfg[cfg["ticker"] == "M0220163"]["name"].tolist()
 
-        # 2. 月度 CPI / PMI
-        df_macro_wind = self._fetch_monthly_macro(macro_mappings, start, end)
+        for _, row in cfg.iterrows():
+            name = row["name"]
+            print(f"  📡 {name} ({row['ticker']}) ...", end=" ")
 
-        # 3. 社融（可选）
-        df_sf = self._fetch_social_financing(macro_mappings, start, end)
+            try:
+                df_s = self.fetch_series(name, start, end, use_cache=use_cache)
+            except Exception as e:
+                print(f"⚠️ 失败 ({e})")
+                continue
+            if df_s is None or len(df_s) == 0 or name not in df_s.columns:
+                print("⚠️ 无数据")
+                continue
 
-        # 4. M1 / M2 同比（可选）
-        df_m1m2 = self._fetch_m1m2(macro_mappings, start, end)
+            df_s["Date"] = pd.to_datetime(df_s["Date"])
+            # 存价格，最后统一算收益率
+            price_series.append(df_s[["Date", name]].rename(columns={name: f"_price_{name}"}))
+            print(f"✅ {len(df_s)} 日")
 
-        # 5. 统一月度时间索引
-        monthly_range = pd.date_range(
-            start=pd.to_datetime(start), end=pd.to_datetime(end), freq="ME"
-        )
-        df_macro = pd.DataFrame(index=monthly_range)
-        df_macro.index.name = "Date"
-        df_macro = df_macro.reset_index()
-        df_macro["YM"] = df_macro["Date"].dt.to_period("M")
-        df_macro = df_macro.set_index("YM")
+        if not price_series:
+            return pd.DataFrame()
 
-        for col in ["CN10Y", "US10Y", "CPI", "PMI", "SF_ratio", "SF_total", "M1_YoY", "M2_YoY"]:
-            df_macro[col] = np.nan
+        # 合并所有价格序列
+        df_price = price_series[0]
+        for s in price_series[1:]:
+            df_price = pd.merge(df_price, s, on="Date", how="outer")
+        df_price = df_price.sort_values("Date").ffill()
 
-        df_macro.update(monthly_yield_avg)
-        df_macro.update(df_macro_wind)
-        if df_sf is not None:
-            df_macro.update(df_sf)
-        if df_m1m2 is not None:
-            df_macro.update(df_m1m2)
+        # 算收益率
+        result = df_price[["Date"]].copy()
+        for col in df_price.columns:
+            if col.startswith("_price_"):
+                asset_name = col.replace("_price_", "")
+                if asset_name in cash_assets:
+                    # 现金: 日收益 = 前日值 / 100 / 365
+                    result[asset_name] = df_price[col].shift(1) / 100 / 365
+                    result[asset_name] = result[asset_name].fillna(0)
+                else:
+                    result[asset_name] = df_price[col].pct_change()
 
-        df_macro = df_macro.reset_index(drop=True)
-        df_macro = df_macro.ffill().bfill()
-        return df_macro
+        result = result.dropna(how="all", subset=[c for c in result.columns if c != "Date"])
+        return result.reset_index(drop=True)
+
+    # ── 缓存管理 ──
+
+    def list_cache(self) -> pd.DataFrame:
+        """列出所有 Parquet 缓存文件及其行数和日期范围"""
+        rows = []
+        for p in sorted(self.cache_dir.glob("*.parquet")):
+            df = pd.read_parquet(p)
+            date_cols = [c for c in df.columns if "date" in c.lower()]
+            if date_cols:
+                dates = pd.to_datetime(df[date_cols[0]])
+                date_range = f"{dates.min():%Y-%m-%d} ~ {dates.max():%Y-%m-%d}"
+            else:
+                date_range = "N/A"
+            rows.append({
+                "name": p.stem,
+                "rows": len(df),
+                "cols": list(df.columns),
+                "date_range": date_range,
+                "size_kb": round(p.stat().st_size / 1024, 1),
+            })
+        return pd.DataFrame(rows)
+
+    def clear_cache(self, names: Optional[list] = None) -> int:
+        """
+        清除 Parquet 缓存。
+
+        Parameters
+        ----------
+        names : list of str, optional
+            要清除的序列名，None 表示清除全部
+
+        Returns
+        -------
+        int
+            删除的文件数
+        """
+        count = 0
+        for p in sorted(self.cache_dir.glob("*.parquet")):
+            if names is None or p.stem in names:
+                p.unlink()
+                count += 1
+        return count

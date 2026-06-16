@@ -1,44 +1,47 @@
-import json
+# -*- coding: utf-8 -*-
+"""
+Module: data_hub.py
+Description: 数据中台 — 简化版
+
+基于 WindFetcher 的薄封装，提供:
+  - get_returns(): 日频资产收益率
+  - get_macro():   月频宏观因子
+  - get_universe(): 资产池管理
+
+配置来源: config/asset_tickers.csv + config/macro_tickers.csv
+缓存位置: data/cache/*.parquet
+"""
+
 import os
+from typing import Optional
+
 import pandas as pd
-from models.data_loader import ExcelDataLoader, WindDataLoader
+
+from models.data_loader import WindFetcher
 from models.universe import Universe
 
+
 class DataHub:
-    _instance = None
+    """
+    数据中台 — 统一数据入口。
 
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super(DataHub, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+    Parameters
+    ----------
+    cache_dir : str, optional
+        Parquet 缓存目录
+    start_date : str, optional
+        数据起始日期
+    """
 
-    def __init__(self, config_path=None):
-        if self._initialized:
-            return
-            
-        if config_path is None:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            config_path = os.path.join(base_dir, "data_hub_config.json")
-            
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = json.load(f)
-            
-        self.data_source = self.config.get("data_source", "excel").lower()
-        
-        # 初始化对应的加载器
-        if self.data_source == "wind":
-            self.loader = WindDataLoader(self.config)
-        else:
-            self.loader = ExcelDataLoader(self.config)
-            
-        # 实例化资产池管理器
-        self.universe = Universe(self.config.get("universe", {}))
-        
-        # 缓存容器，规避重复读取或调用接口
-        self._cached_returns = None
-        self._cached_macro = None
-        self._initialized = True
+    def __init__(
+        self,
+        cache_dir: Optional[str] = None,
+        start_date: str = "2011-01-01",
+    ):
+        self.fetcher = WindFetcher(cache_dir=cache_dir, start_date=start_date)
+        self.universe = Universe()
+        self._cached_returns: Optional[pd.DataFrame] = None
+        self._cached_macro: Optional[pd.DataFrame] = None
 
     def get_universe(self) -> Universe:
         return self.universe
@@ -46,54 +49,48 @@ class DataHub:
     def get_safe_asset(self) -> str:
         return self.universe.get_safe_asset()
 
-    def get_returns(self, assets, start_date=None, end_date=None) -> pd.DataFrame:
+    def get_returns(
+        self,
+        assets: Optional[list] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
         """
-        根据资产列表与时间区间获取日频收益率。
-        """
-        all_requested = set(assets)
-        if self._cached_returns is not None:
-            cached_cols = set(self._cached_returns.columns) - {'Date'}
-        else:
-            cached_cols = set()
-            
-        # 如果缓存中缺少某些请求的资产，则需要动态加载并拼接
-        if not all_requested.issubset(cached_cols):
-            missing_assets = list(all_requested - cached_cols)
-            new_df = self.loader.load_returns(missing_assets)
-            if self._cached_returns is None:
-                self._cached_returns = new_df
-            else:
-                self._cached_returns = pd.merge(self._cached_returns, new_df, on="Date", how="outer").sort_values("Date")
-                
-        df = self._cached_returns.copy()
-        df['Date'] = pd.to_datetime(df['Date'])
-        
-        # 保证返回的列仅包含 Date 和请求的资产列（且按照请求顺序排列）
-        cols = ['Date'] + [a for a in assets if a in df.columns]
-        df = df[cols]
-        
-        # 时间过滤
-        if start_date:
-            df = df[df['Date'] >= pd.to_datetime(start_date)]
-        if end_date:
-            df = df[df['Date'] <= pd.to_datetime(end_date)]
-            
-        return df.reset_index(drop=True)
+        获取日频资产收益率。
 
-    def get_macro_data(self, start_date=None, end_date=None) -> pd.DataFrame:
+        Parameters
+        ----------
+        assets : list of str, optional
+            资产名称列表，None 表示全部
+        start_date, end_date : str, optional
+            时间区间
+        use_cache : bool
+            是否使用 Parquet 缓存
         """
-        加载月频宏观因子数据。
+        if self._cached_returns is None or not use_cache:
+            self._cached_returns = self.fetcher.fetch_returns(
+                asset_names=assets, start_date=start_date,
+                end_date=end_date, use_cache=use_cache,
+            )
+        df = self._cached_returns.copy()
+        if assets:
+            cols = ["Date"] + [a for a in assets if a in df.columns]
+            df = df[cols]
+        return df
+
+    def get_macro(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
         """
-        if self._cached_macro is None:
-            self._cached_macro = self.loader.load_macro_data()
-            
-        df = self._cached_macro.copy()
-        df['Date'] = pd.to_datetime(df['Date'])
-        
-        # 时间过滤
-        if start_date:
-            df = df[df['Date'] >= pd.to_datetime(start_date)]
-        if end_date:
-            df = df[df['Date'] <= pd.to_datetime(end_date)]
-            
-        return df.reset_index(drop=True)
+        获取月频宏观因子数据。
+        """
+        if self._cached_macro is None or not use_cache:
+            self._cached_macro = self.fetcher.fetch_macro(
+                start_date=start_date, end_date=end_date,
+                use_cache=use_cache,
+            )
+        return self._cached_macro.copy()

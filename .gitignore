@@ -2,7 +2,8 @@
 data/
 *.xlsx
 *.xls
-*.csv
+# CSV: 排除 data/ 目录下的数据 CSV，但保留 config/ 下的配置 CSV
+data/input/*.csv
 *.h5
 *.hdf5
 *.parquet
