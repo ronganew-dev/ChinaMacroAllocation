@@ -5,6 +5,9 @@
 输入 pd.Series → 输出 float / Dict[str, float] / Dict[str, int]。
 
 参考标准：WorldQuant BRAIN Formulaic Operators 工程规范。
+在大类资产配置场景下，
+用月线构建的时序动量比用日线或周线构建的时序动量的整体效果要好，用时序动量识别趋势破位比用时序动量识别趋势突破的准确率要高。
+从行为金融学的角度来解释，可能跟非理性投资者的“处置效应”和“锚定效应”有关系。所谓处置效应，是指投资者倾向于卖出浮盈的资产而继续持有浮亏的资产，导致浮亏筹码的换手不充分、出清过程漫长；所谓锚定效应，是指当浮亏的资产重新涨回成本价时，部分投资者会果断卖出收回本金，导致上涨过程阻力重重。这些可能是大类资产中长期空头趋势更容易得到延续的原因。
 """
 
 from typing import Dict, List, Optional
@@ -15,6 +18,99 @@ import pandas as pd
 from operators.base import nanmask
 
 BDAYS_PER_YEAR = 252
+
+
+def ts_multi_dimensional_momentum_operator(
+    daily_prices_df: pd.DataFrame,
+    ma_days: list = [20, 60, 120],
+    fast_month: int = 5,
+    slow_month: int = 20,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+    bb_window: int = 20,
+    bb_std: float = 2.0
+) -> pd.DataFrame:
+    """
+    WorldQuant BRAIN 风格：多维时序绝对动量融合算子 (TS-Multi-Mom)
+    
+    输入：
+        daily_prices_df: 日度收盘价矩阵 (DataFrame)，index为DatetimeIndex，columns为资产代码
+    输出：
+        risk_multipliers: 与输入维度一致的月频风险预算乘数矩阵 (DataFrame)，值域 [0, 1]
+    """
+    # 确保没有空值干扰计算
+    df_daily = daily_prices_df.ffill().bfill()
+    
+    # =========================================================================
+    # 1. 日线级别算子：均线相对位置 (MA Distance) & MACD
+    # =========================================================================
+    # 计算日线 MA 偏离度：(Price / MA) - 1
+    ma_scores = pd.DataFrame(0.0, index=df_daily.index, columns=df_daily.columns)
+    for ma in ma_days:
+        ma_series = df_daily.rolling(window=ma, min_periods=ma).mean()
+        # 价格在均线上方贡献正分，下方贡献负分
+        ma_scores += (df_daily / ma_series - 1.0)
+    # 归一化均线得分 (简单的符号化或缩放，这里采用符号映射：多头市场得 1，空头市场得 0)
+    ma_signal = np.where(ma_scores > 0, 1.0, 0.0)
+    ma_signal_df = pd.DataFrame(ma_signal, index=df_daily.index, columns=df_daily.columns)
+
+    # 日线 MACD 计算
+    exp_fast = df_daily.ewm(span=macd_fast, adjust=False).mean()
+    exp_slow = df_daily.ewm(span=macd_slow, adjust=False).mean()
+    macd_dif = exp_fast - exp_slow
+    macd_dea = macd_dif.ewm(span=macd_signal, adjust=False).mean()
+    macd_hist = macd_dif - macd_dea
+    # MACD 处于绿柱且绿柱扩大时（柱状图 < 0 且今日值比昨日值更小），提示趋势破位得 0.0；其余情况为 1.0
+    macd_prev = macd_hist.shift(1)
+    macd_signal = np.where((macd_hist < 0) & (macd_hist < macd_prev), 0.0, 1.0)
+    macd_signal_df = pd.DataFrame(macd_signal, index=df_daily.index, columns=df_daily.columns)
+
+    # =========================================================================
+    # 2. 月线级别算子：双均线交叉 (Monthly MA Cross) & 月线布林带 (Monthly Bollinger Bands)
+    # =========================================================================
+    df_monthly = df_daily.resample('ME').last()
+    
+    # 2.1 月线双均线交叉
+    m_ma_fast = df_monthly.rolling(window=fast_month, min_periods=fast_month).mean()
+    m_ma_slow = df_monthly.rolling(window=slow_month, min_periods=slow_month).mean()
+    # 金叉（快线 > 慢线）得 1.0，死叉得 0.0，初始缺失值设为 NaN 以便后续兜底
+    m_ma_signal = np.where(m_ma_fast.isna() | m_ma_slow.isna(), np.nan, np.where(m_ma_fast > m_ma_slow, 1.0, 0.0))
+    m_ma_signal_df = pd.DataFrame(m_ma_signal, index=df_monthly.index, columns=df_monthly.columns)
+
+    # 2.2 月线布林带
+    m_bb_mid = df_monthly.rolling(window=bb_window, min_periods=bb_window).mean()
+    m_bb_std_dev = df_monthly.rolling(window=bb_window, min_periods=bb_window).std()
+    m_bb_upper = m_bb_mid + bb_std * m_bb_std_dev
+    m_bb_lower = m_bb_mid - bb_std * m_bb_std_dev
+    # 从上到下穿越中轨时提示趋势破位 (得 0.0)；但突破下轨时是反转信号，不能再看空 (得 1.0)；其余（中轨上方）得 1.0
+    m_bb_signal = np.where(
+        m_bb_mid.isna() | m_bb_lower.isna(),
+        np.nan,
+        np.where((df_monthly >= m_bb_mid) | (df_monthly <= m_bb_lower), 1.0, 0.0)
+    )
+    m_bb_signal_df = pd.DataFrame(m_bb_signal, index=df_monthly.index, columns=df_monthly.columns)
+
+    # =========================================================================
+    # 3. 多维动量合成与时间轴对齐 (Monthly Resample)
+    # =========================================================================
+    # 日线指标综合 (均值融合，包含均线和MACD两个维度)
+    daily_combined = (ma_signal_df + macd_signal_df) / 2.0
+    
+    # 将日线综合指标降采样至月频（取月底那天的状态）
+    monthly_daily_combined = daily_combined.resample('ME').last()
+    
+    # 月线指标综合 (均值融合，包含双均线交叉和布林带两个维度)
+    monthly_combined = (m_ma_signal_df + m_bb_signal_df) / 2.0
+    
+    # 融合月线指标：日线指标占 60% 权重，月线长周期指标占 40% 权重
+    final_momentum_score = (monthly_daily_combined * 0.6) + (monthly_combined * 0.4)
+    
+    # 兜底处理：由于滚动窗口导致的初始缺失值，默认不扣减风险预算（填 1.0）
+    final_momentum_score = final_momentum_score.fillna(1.0)
+    
+    # 严格保证输出在 [0.0, 1.0] 之间，且保持严格的 DateTimeIndex
+    return final_momentum_score
 
 # ===================================================================
 # 滞后自相关 | Lag-k Autocorrelation

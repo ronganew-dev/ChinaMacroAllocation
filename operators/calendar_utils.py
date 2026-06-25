@@ -4,7 +4,6 @@
 每个函数 = 一个原子公式，纯向量化，零显式循环。
 输入 pd.DatetimeIndex / Dict → 输出 pd.Series / None。
 
-参考标准：WorldQuant BRAIN Formulaic Operators 工程规范。
 """
 
 from typing import Dict, Optional
