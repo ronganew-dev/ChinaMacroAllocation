@@ -1,124 +1,60 @@
-# ChinaMacroAllocation 🇨🇳📊
+# ChinaMacroAllocation — 通用量化算子库
 
-> 宏观周期驱动的多资产配置引擎 + 通用量化算子库
-> 基于美林时钟四阶段信号，用 Risk Parity（子组合风险贡献均等化）做基准权重，再用 DAA 概率乘数做周期偏移调制，最后通过阈值+延迟进行仿真交易。
-> 本项目参考了 WorldQuant 101 Alpha 的设计思想。针对原生 Pandas 在计算高频/长周期滚动算子时产生的内存抖动和速度瓶颈，本项目在 operators/ 中针对时序算子引入了 NumPy 向量化优化（或 Numba 加速），在保证逻辑清晰的同时，将计算截面因子的耗时降低了 15%
-
----
-
-## 项目总览
-
-**ChinaMacroAllocation** 是一个基于中国宏观经济周期信号的量化资产配置框架。它将周期信号映射到多资产组合的风险预算，支持 EWMA 风险建模、子组合控制与动态再平衡。
-
-项目同时提炼出一套 **通用量化算子库** (`operators/`)，可独立复用于趋势跟踪、动量分析、波动率建模等场景。
-
-### 核心框架
-
-```
-┌─────────────────────────────────────────────────┐
-│                 ChinaMacroAllocation              │
-│  ┌─────────────┐  ┌────────────┐  ┌───────────┐ │
-│  │  strategy/   │  │ analysis/  │  │operators/ │ │
-│  │  宏观配置策略  │  │  分析工具   │  │  通用算子   │ │
-│  └──────┬──────┘  └─────┬──────┘  └─────┬─────┘ │
-│         │                │               │        │
-│         └────────────────┼───────────────┘        │
-│                    可插拔算子架构                    │
-└─────────────────────────────────────────────────┘
-```
-
----
-
-## 目录结构
-
-```
-ChinaMacroAllocation/
-│
-├── operators/                    # 🔧 通用量化算子库（可独立复用）
-│   ├── __init__.py
-│   ├── base.py                   # nanmask 装饰器 + 类型别名
-│   ├── momentum.py               # 动量/趋势 (ACF, SNR, Hurst, 均线回测)
-│   ├── volatility.py             # 波动率/风险 (EWMA协方差, 回撤, Ulcer Index)
-│   ├── cross_sectional.py        # 横截面 (排名、标准化、复合评分、行业中性化)
-│   └── volume.py                 # 🔄 量价结合 (开发中)
-│
-├── strategy/                     # 📈 宏观周期配置策略
-│   ├── __init__.py
-│   ├── config.py                 # 全局参数 (资产、风险、调仓)
-│   └── utils.py                  # 工具函数
-│
-├── analysis/                     # 📊 资产分析模块
-│   ├── __init__.py
-│   └── trend_follow.py           # 趋势跟踪适合度分析
-│
-├── tests/                        # ✅ 单元测试
-│   ├── __init__.py
-│   ├── test_momentum.py
-│   └── test_volatility.py
-│
-├── data/                         # 📁 数据目录 (gitignored)
-├── requirements.txt              # 📦 极简依赖
-└── README.md
-```
+> 从实盘策略中提炼的开箱即用**量化小工具集合**，可独立复用于趋势跟踪、动量分析、波动率建模、周期识别、横截面评分等场景。
+>
+> 所有算子遵循 **WorldQuant BRAIN Formulaic Operators** 工程规范：纯函数式、全程向量化、原子粒度。每个函数就是一个公式，拿来即用。
 
 ---
 
 ## 快速开始
 
-### 安装
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### 运行趋势分析
+```python
+from operators import snr, hurst_exponent, drawdown_details
 
-```bash
-python -m analysis.trend_follow
-```
+# 趋势强度
+signal = snr(return_series)
 
-### 运行测试
+# 趋势持续性
+h = hurst_exponent(return_series)
 
-```bash
-pytest tests/ -v
+# 回撤分析
+dd = drawdown_details((1 + return_series).cumprod())
+print(dd["max_drawdown"], dd["recovery_date"])
 ```
 
 ---
 
-## 🧮 算子手册 (Formulaic Operators)
+## 算子一览
 
-所有算子遵循 **WorldQuant BRAIN Formulaic Operators** 工程规范：
-- **纯函数式** — 无类、无状态、无 `fit/transform`
-- **全程向量化** — 零显式 Python 数据元素循环
-- **原子粒度** — 每个函数 = 一个公式
+### 动量 / 趋势 (`momentum.py`)
 
-### 动量/趋势类 (`operators/momentum.py`)
+| 函数 | 说明 |
+|------|------|
+| `acf()` / `acf_multi()` | 单阶 / 多阶滞后自相关 |
+| `snr()` | 信噪比（年化收益 / 年化波动） |
+| `hurst_exponent()` | Hurst 指数（R/S 重标极差，纯向量化） |
+| `streaks()` | 连涨连跌极值 |
+| `trend_efficiency()` | 趋势效率：总收益 / 总振幅 |
+| `trend_strength()` | 趋势强度：累计净值偏离 |
+| `trend_stability()` | 趋势稳定性：快慢均线同向比例 |
+| `ma_crossover_metrics()` | 均线交叉策略绩效 |
 
-| 函数 | 说明 | 公式 |
-|------|------|------|
-| `acf()` | 单阶滞后自相关 | $\rho(k) = \text{Corr}(r_t, r_{t-k})$ |
-| `acf_multi()` | 多阶自相关聚合 | — |
-| `snr()` | 信噪比 | $\text{SNR} = \mu_{\text{ann}} / \sigma_{\text{ann}}$ |
-| `hurst_exponent()` | Hurst 指数 | R/S 重标极差分析（纯向量化） |
-| `streaks()` | 连涨连跌极值 | 最长连续正/负收益天数 |
-| `trend_efficiency()` | 趋势效率 | $\eta = [\prod(1+r)-1] / \sum\|r\|$ |
-| `trend_strength()` | 趋势强度 | $\| \prod(1+r)-1 \|$ |
-| `trend_stability()` | 趋势稳定性 | 快慢均线同向比例 |
-| `ma_crossover_metrics()` | 均线交叉策略绩效 | 20/60 SMA crossover |
+### 波动率 / 风险 (`volatility.py`)
 
-### 波动率/风险类 (`operators/volatility.py`)
+| 函数 | 说明 |
+|------|------|
+| `ewma_weights()` | EWMA 衰减权重 |
+| `ewma_cov()` | 指数加权协方差矩阵 |
+| `drawdown_series()` / `max_drawdown()` | 回撤序列 / 最大回撤 |
+| `drawdown_details()` | 回撤峰值、谷底、恢复详情 |
+| `recovery_time()` | 恢复所需交易日数 |
+| `ulcer_index()` | Ulcer 指数 |
 
-| 函数 | 说明 | 公式 |
-|------|------|------|
-| `ewma_weights()` | EWMA 衰减权重 | $w_i = (1-\lambda)\lambda^{n-1-i}$ |
-| `ewma_cov()` | 指数加权协方差矩阵 | $\Sigma = \sum w_i (x_i-\mu)^T(x_i-\mu)$ |
-| `drawdown_series()` | 回撤时间序列 | $DD(t)=NAV(t)/\max_{s\leq t}NAV(s)-1$ |
-| `max_drawdown()` | 最大回撤 | $\min_t DD(t)$ |
-| `drawdown_details()` | 回撤峰值 / 谷底 / 恢复详情 | — |
-| `recovery_time()` | 恢复交易日数 | — |
-| `ulcer_index()` | Ulcer 指数 | $\sqrt{\frac{1}{N}\sum DD(t)^2}$ |
-
-### 横截面类 (`operators/cross_sectional.py`)
+### 横截面 (`cross_sectional.py`)
 
 | 函数 | 说明 |
 |------|------|
@@ -127,47 +63,40 @@ pytest tests/ -v
 | `composite_score()` | 加权复合评分（矩阵向量化） |
 | `sector_neutralize()` | 行业中性化（去均值 / 标准化） |
 
-### 快速使用
+### 周期分析 (`fourier_cycle.py`, `sin_fit.py`, `HP_filter.py`)
 
-```python
-from operators import snr, hurst_exponent, drawdown_details, composite_score
+| 函数 | 说明 |
+|------|------|
+| FFT 频谱分析 | 提取序列主导周期 |
+| 正弦波拟合 | 非线性最小二乘拟合相位/振幅 |
+| HP 滤波 | 趋势-周期分解 |
 
-# 时序算子 — 传入 Series，返回数值
-signal = snr(return_series)
-h = hurst_exponent(return_series)
+### 宏观数据 (`macro_data_fetcher.py`, `China_macro_data_cleanser.py`)
 
-# 回撤分析 — 传入净值 Series
-dd = drawdown_details((1 + return_series).cumprod())
-print(dd["max_drawdown"], dd["recovery_date"])
+| 函数 | 说明 |
+|------|------|
+| 数据获取 | FRED / Wind 宏观指标拉取 |
+| 数据清洗 | 异常值处理、频次对齐、插值填充 |
 
-# 横截面排名 — 传入 DataFrame，行=资产、列=指标
-ranks = cross_sectional_rank(metrics_df, {"SNR": True, "Hurst": True})
-scored = composite_score(ranks, {"SNR": 0.5, "Hurst": 0.5})
-```
+### 辅助工具
+
+| 模块 | 说明 |
+|------|------|
+| `calendar_utils.py` | 交易日历、偏移计算 |
+| `risk_control.py` | 风控规则引擎 |
+| `BryBroschan.py` | Bry-Broschan 周期拐点识别 |
+| `OECD_synthetic.py` | OECD 合成指数构建 |
 
 ---
 
-## 🏗️ 构建哲学
-
-### Formulaic Operators
-
-本项目的算子库严格遵循 **WorldQuant BRAIN Formulaic Operators** 工程规范：
+## 构建哲学 — Formulaic Operators
 
 1. **纯函数式** — 没有类、没有 `fit/transform`、没有内部状态。每个算子就是一个纯函数：`f(Series) → value`
-2. **全程向量化** — 所有算子通过 pandas/numpy 的向量化操作实现，零显式 Python `for` 循环操作数据元素
-3. **原子粒度** — 每个函数只完成一个公式的计算（例如 `snr()` 只算信噪比，不包含排名逻辑）
-4. **pandas-first** — 所有时序算子直接接受 `pd.Series` 作为输入，保持索引对齐
+2. **全程向量化** — 所有算子通过 pandas / numpy 向量化实现，零显式 Python 数据元素循环
+3. **原子粒度** — 每个函数只完成一个公式的计算
+4. **pandas-first** — 时序算子直接接受 `pd.Series` 作为输入，保持索引对齐
 
-这种设计的直接好处：**可单元测试、可组合、可复用**。
-
-### 渐进式重构
-
-项目采用"先建立结构，再填充内容"的策略。第一版建立完整的算子框架和测试体系，后续按模块逐步：
-
-1. ✅ 算子库骨架 + 现有代码提炼
-2. ✅ Formulaic Operators 工程化重写
-3. 🔄 `strategy/` 回测引擎完整化
-4. ⏳ `volume.py` 量价算子实现
+结果：**可单元测试、可组合、可复用**。
 
 ---
 
@@ -177,7 +106,6 @@ scored = composite_score(ranks, {"SNR": 0.5, "Hurst": 0.5})
 |------|------|
 | 数据处理 | pandas, numpy |
 | 统计分析 | scipy |
-| Excel I/O | openpyxl |
 | 测试 | pytest |
 
 ---
